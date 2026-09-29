@@ -37,6 +37,7 @@
 //! |---|---|---|
 //! | `NextStreamId` | 32 | `ScVec(1)[ Symbol("NextStreamId") ]` |
 //! | `Stream(id)` | 40 | `ScVec(2)[ Symbol("Stream"), U64(id) ]` |
+//! | `PooledBalance(token)` | — | `ScVec(2)[ Symbol("PooledBalance"), Address ]` |
 //!
 //! `NextStreamId` is 32 bytes; `Stream(id)` is always 40 bytes.  The two
 //! variants therefore cannot collide regardless of `id`.  Two `Stream(n)` and
@@ -296,6 +297,59 @@ fn every_data_key_variant_has_a_known_encoding() {
              both `known_encodings` above and the dedicated per-variant test \
              in this file."
         );
+    }
+}
+
+/// `PooledBalance(token)` must be **one entry per token**, and no two variants
+/// may share an encoding.
+///
+/// The pool total is kept per token (`DataKey::PooledBalance`), so a collision
+/// between two tokens — or with any other variant — would silently overwrite
+/// one token's expected balance with another's, which is exactly the
+/// desynchronisation `Error::PoolBalanceDrift` exists to catch. The variant
+/// name is part of the encoding, which is what keeps appended variants safe.
+#[test]
+fn pooled_balance_key_is_per_token_and_collision_free() {
+    let env = Env::default();
+    let a = soroban_sdk::Address::generate(&env);
+    let b = soroban_sdk::Address::generate(&env);
+
+    let key_a = key_hex(&env, DataKey::PooledBalance(a.clone()));
+    let key_b = key_hex(&env, DataKey::PooledBalance(b.clone()));
+
+    assert_ne!(
+        key_a, key_b,
+        "two tokens must never share a PooledBalance key",
+    );
+    assert_eq!(
+        key_a,
+        key_hex(&env, DataKey::PooledBalance(a.clone())),
+        "the same token must re-encode to the same key",
+    );
+
+    // The variant name is carried in the encoding, which is what makes the
+    // append-only policy in the module docs safe.
+    assert!(
+        key_a.contains("506f6f6c656442616c616e6365"), // "PooledBalance"
+        "the encoding must carry the variant name: {key_a}",
+    );
+
+    // No collision with any other variant, at representative ids.
+    for (label, other) in [
+        ("NextStreamId", key_hex(&env, DataKey::NextStreamId)),
+        ("StreamCount", key_hex(&env, DataKey::StreamCount)),
+        ("Stream(0)", key_hex(&env, DataKey::Stream(0))),
+        ("Stream(MAX)", key_hex(&env, DataKey::Stream(u64::MAX))),
+        (
+            "Delegate(0, a)",
+            key_hex(&env, DataKey::Delegate(0, a.clone())),
+        ),
+        (
+            "Delegate(0, b)",
+            key_hex(&env, DataKey::Delegate(0, b.clone())),
+        ),
+    ] {
+        assert_ne!(key_a, other, "PooledBalance(a) collides with {label}",);
     }
 }
 

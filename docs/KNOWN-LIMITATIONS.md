@@ -242,18 +242,47 @@ keeper path both exist to absorb that.
 
 ---
 
-## 6. Rebasing tokens can desynchronize the pool, undetected
+## 6. Rebasing tokens are detected only when the pool is next touched
 
 See [ABI.md "Token assumptions"](ABI.md#token-assumptions) for the full
 statement. Fee-on-transfer tokens are detected and rejected on the deposit
-leg (`Error::TokenAmountMismatch`); a token whose balances change outside of a
-transfer Fluxora itself initiated — an elastic-supply rebase — cannot be
-detected at call time, because there is no transfer to instrument. Should one
-be used anyway, the pool invariant (`Harness::assert_pool_invariant`) can be
-violated on-chain, and the only symptom is a later `withdraw` or `cancel`
-failing closed with `Error::TokenTransferFailed` once the shortfall is
-reached. Integrators choosing a token for a stream are responsible for
-confirming it does not rebase.
+leg (`Error::TokenAmountMismatch`). A token whose balances change outside of a
+transfer Fluxora itself initiated — an elastic-supply rebase — has no transfer
+to instrument, so it cannot be caught *as it happens*. It is no longer silent,
+though: Fluxora tracks the balance it expects to hold per token and reconciles
+it against the token's own `balance` at the end of every operation that moves
+pool funds, so the next `withdraw`, `cancel`, `top_up` or `batch_withdraw`
+after a rebase reverts with `Error::PoolBalanceDrift` (34) rather than
+misaccounting.
+
+What is left open is narrower than it was, and inherent:
+
+* **Detection is reactive.** Nothing executes while the contract sits idle, so
+  a rebase is only observed by the next operation on that token. A stream that
+  is never touched again is never reconciled — but it also never moves funds,
+  so no recipient is paid a wrong amount in the meantime. Off-chain views
+  (`withdrawable_of`, `refundable_of`) report pre-rebase figures until then,
+  because they are pure functions of stream accounting.
+* **A net-zero rebase is invisible.** The expected total is a single
+  per-token figure compared against the token's own balance, so a positive and
+  a negative rebase on the same token that cancel out before the next
+  operation leave nothing to detect.
+* **Surpluses are accepted deliberately.** The check is `actual < expected`,
+  never `actual != expected`: a positive rebase (or a donation) cannot cause an
+  underpayment, while rejecting one would let any third party freeze every
+  withdrawal in the protocol by transferring a single unit into the contract.
+* **A pool funded before this change is not retroactively covered.** The
+  expected total starts at zero for a token whose balance predates the tracked
+  ledger, so the first post-upgrade payout drives that token's total negative
+  and it reads as a permanent surplus: its drift is accepted, not reported.
+  Closing this would need a migration that walks every stream to re-derive the
+  totals, and the contract keeps no index of which streams hold which token.
+  Detection covers balances Fluxora has credited itself — every deposit made
+  through the contract after the change.
+
+Integrators choosing a token for a stream are still responsible for confirming
+it does not rebase; `test::rebase_drift` covers what the contract now catches,
+and the fixture makes the remaining gaps executable rather than theoretical.
 
 ---
 

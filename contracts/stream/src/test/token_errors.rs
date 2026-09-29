@@ -59,7 +59,7 @@
 //! |---|---|---|---|
 //! | no fee-on-transfer | `create_stream` | deposit pull delivers 90% of `deposit` | `TokenAmountMismatch`, no entry |
 //! | no fee-on-transfer | `top_up` | pull delivers 90% of `amount` | `TokenAmountMismatch`, stream unchanged |
-//! | no rebasing | `withdraw` | pool balance reduced out-of-band (clawback, standing in for a negative rebase) | `TokenTransferFailed` — fails closed, other streams' accounting untouched |
+//! | no rebasing | `withdraw` | pool balance reduced out-of-band (clawback, standing in for a negative rebase) | `PoolBalanceDrift` — fails closed, other streams' accounting untouched |
 //! | zero transfers never issued | `cancel` | refund is exactly zero at maturity | succeeds; a token that panics on a zero-value transfer proves none was called |
 //! | zero transfers never issued | `withdraw` | nothing vested yet | `NothingToWithdraw`, no token call |
 //! | zero transfers never issued | `batch_withdraw` | one stream in the batch has nothing available | batch succeeds; skipped stream's `withdrawn` stays 0 |
@@ -505,6 +505,11 @@ fn batch_withdraw_returns_token_transfer_failed_when_pool_is_underfunded() {
 /// including the `withdrawn` counter increment.  Replenishing the pool and
 /// retrying succeeds and pays out the full amount — the failed call left no
 /// trace in the accounting.
+///
+/// Replenishment has to be *complete*, not just enough for this payout: the
+/// pool total Fluxora reconciles against was never debited by the failed call,
+/// so restoring less than the drained amount now reads as a drift and is
+/// rejected. Both halves are asserted below.
 #[test]
 fn withdraw_is_retryable_once_pool_is_replenished() {
     let h = Harness::new();
@@ -536,12 +541,23 @@ fn withdraw_is_retryable_once_pool_is_replenished() {
     assert_eq!(err, Error::TokenTransferFailed);
     assert_eq!(tc.balance(&h.recipient), 0);
 
-    // Replenish and retry.  Because the failed call rolled back entirely,
-    // the retry sees the full withdrawable balance and succeeds.
+    // A partial replenishment is not a repair: the clawback took the whole
+    // deposit, so the accounting still expects `pool`. The payout itself is
+    // affordable, which is exactly the case the reconciliation exists to
+    // catch.
     admin.mint(&contract_id, &available);
+    let err = h.client.try_withdraw(&id, &None).unwrap_err().unwrap();
+    assert_eq!(err, Error::PoolBalanceDrift);
+    assert_eq!(tc.balance(&h.recipient), 0);
+
+    // Restore the pool in full and retry.  Because the failed calls rolled
+    // back entirely, the retry sees the full withdrawable balance and
+    // succeeds.
+    admin.mint(&contract_id, &(pool - available));
     let paid = h.client.withdraw(&id, &None);
     assert_eq!(paid, available);
     assert_eq!(tc.balance(&h.recipient), available);
+    assert_eq!(tc.balance(&contract_id), pool - available);
 }
 
 // ─── fee-on-transfer token ───────────────────────────────────────────────────
@@ -734,16 +750,18 @@ fn top_up_with_fee_on_transfer_token_is_rejected() {
 
 // ─── rebasing / out-of-band balance loss ────────────────────────────────────
 
-/// A rebase is not a `transfer` Fluxora is party to, so it cannot be detected
-/// at call time — there is nothing to instrument. `admin.clawback` on the
-/// pool directly (bypassing every Fluxora entry point) stands in for the
-/// out-of-band balance loss a negative rebase would cause. The documented
-/// contract is that this fails *closed*: the underfunded stream's `withdraw`
-/// returns [`Error::TokenTransferFailed`] rather than paying a wrong amount,
-/// and an unrelated stream sharing the same token is untouched. See
-/// `docs/ABI.md` "Token assumptions" #2.
+/// A rebase is not a `transfer` Fluxora is party to, so it cannot be caught as
+/// it happens. `admin.clawback` on the pool directly (bypassing every Fluxora
+/// entry point) stands in for the out-of-band balance loss a negative rebase
+/// would cause. The documented contract is that this fails *closed*: the next
+/// `withdraw` on the affected token returns
+/// [`Error::PoolBalanceDrift`] rather than paying a wrong amount, and an
+/// unrelated stream sharing the same token is untouched.
+///
+/// See `docs/ABI.md` "Token assumptions" #2 and `test::rebase_drift`, which
+/// uses a token that can rebase with no transfer at all.
 #[test]
-fn rebase_style_balance_loss_fails_closed_and_does_not_corrupt_other_streams() {
+fn rebase_style_balance_loss_is_detected_and_does_not_corrupt_other_streams() {
     let h = Harness::new();
     let (token, tc, admin) = make_clawback_token(&h);
     let contract_id = h.contract_id.clone();
@@ -784,20 +802,22 @@ fn rebase_style_balance_loss_fails_closed_and_does_not_corrupt_other_streams() {
     let a_liability = h.client.withdrawable_of(&a);
     admin.clawback(&contract_id, &(tc.balance(&contract_id) - a_liability));
 
-    // A drains what is left; B — untouched by any Fluxora call — must find
-    // the pool empty and fail closed rather than paying a partial or wrong
-    // amount.
-    h.client.withdraw(&a, &None);
+    // The pool is short, so the next withdrawal on this token is rejected with
+    // the reconciliation error — the pool's real balance no longer backs the
+    // accounting — and the invocation rolls back in full.
+    let err = h.client.try_withdraw(&a, &None).unwrap_err().unwrap();
+    assert_eq!(err, Error::PoolBalanceDrift);
     let err = h.client.try_withdraw(&b, &None).unwrap_err().unwrap();
-    assert_eq!(err, Error::TokenTransferFailed);
+    assert_eq!(err, Error::PoolBalanceDrift);
 
-    // B's own accounting is untouched by A's withdrawal or by the
+    // B's own accounting is untouched by A's rejected withdrawal or by the
     // out-of-band loss: the rebase corrupted the pool's real balance, not
     // Fluxora's bookkeeping.
     let after_b = h.client.get_stream(&b);
     assert_eq!(after_b.withdrawn, before_b.withdrawn);
     assert_eq!(after_b.deposited, before_b.deposited);
     assert_eq!(after_b.status, StreamStatus::Active);
+    assert_eq!(tc.balance(&h.recipient), 0, "no payout may move");
 }
 
 // ─── zero-value transfers are never issued ──────────────────────────────────
@@ -990,8 +1010,10 @@ fn token_error_discriminants_match_the_abi_table() {
     assert_eq!(Error::TokenMissing as u32, 26);
 }
 
-/// Confirm the frozen ABI discriminant for the fee-on-transfer / rebase
-/// detection error.
+/// Confirm the frozen ABI discriminant for the fee-on-transfer detection error.
+///
+/// Rebase detection has its own variant now (`Error::PoolBalanceDrift`, 34) —
+/// see `test::rebase_drift`.
 #[test]
 fn token_amount_mismatch_discriminant_matches_the_abi_table() {
     assert_eq!(Error::TokenAmountMismatch as u32, 32);

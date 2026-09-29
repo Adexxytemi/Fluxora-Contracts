@@ -183,4 +183,25 @@ pub enum Error {
     /// The guard stays because the invariant it protects is load-bearing.
     /// Classified as reserved in `test::error_reachability`.
     VestedDecreased = 33,
+
+    // --- Rebase detection ---
+    /// The pool's real token balance is short of the balance Fluxora has
+    /// accounted for.
+    ///
+    /// Fluxora keeps a per-token running total of the balance it expects to
+    /// hold ([`DataKey::PooledBalance`]) — every pull credits it, every
+    /// payout and refund debits it — and reconciles that total against the
+    /// token's own `balance` at the end of every operation that moves pool
+    /// funds. A shortfall means the token changed balances outside a
+    /// transfer Fluxora was a party to: an elastic-supply rebase, the exact
+    /// case `docs/KNOWN-LIMITATIONS.md` §6 recorded as undetectable. The
+    /// invocation reverts instead of letting one recipient be paid out of
+    /// another's claim.
+    ///
+    /// A **surplus** is deliberately tolerated, never reported: a positive
+    /// rebase cannot cause an underpayment, and rejecting one would let any
+    /// third party freeze every withdrawal by dusting the contract with a
+    /// single unit. See `docs/ABI.md` "Token assumptions" and
+    /// `test::rebase_drift`.
+    PoolBalanceDrift = 34,
 }

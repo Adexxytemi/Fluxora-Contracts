@@ -290,7 +290,8 @@
     {"name": "RepeatedTransfer", "discriminant": 30},
     {"name": "InvalidTopUp", "discriminant": 31},
     {"name": "TokenAmountMismatch", "discriminant": 32},
-    {"name": "VestedDecreased", "discriminant": 33}
+    {"name": "VestedDecreased", "discriminant": 33},
+    {"name": "PoolBalanceDrift", "discriminant": 34}
   ],
   "events": [
     {

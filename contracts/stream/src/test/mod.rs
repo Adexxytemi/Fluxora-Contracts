@@ -49,6 +49,11 @@ mod top_up;
 mod transfer;
 mod withdraw_cancel_same_ledger;
 
+// Issue #1805 — a rebasing token that changes the pool's balance outside a
+// transfer is detected at the next operation that moves funds
+// (`Error::PoolBalanceDrift`) instead of silently desynchronising the pool.
+mod rebase_drift;
+
 // Stage 3
 mod accounting_identity;
 mod accrual_overflow;

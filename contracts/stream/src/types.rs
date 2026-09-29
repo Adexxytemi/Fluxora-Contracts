@@ -130,6 +130,19 @@ pub enum DataKey {
     /// Incremented only in the same transaction as `NextStreamId` and the
     /// corresponding `Stream(id)` entry.
     StreamCount,
+    /// Instance storage. One entry per token: the balance Fluxora expects to
+    /// hold, i.e. the sum of every live stream's outstanding liability plus
+    /// any refund that has been debited but not yet transferred. Credited by
+    /// every verified deposit pull, debited by every payout and refund, and
+    /// reconciled against the token's own `balance` at the end of every
+    /// operation that moves pool funds (`Error::PoolBalanceDrift`).
+    ///
+    /// Instance storage rather than persistent: the total is a hot-path read
+    /// for every withdrawal, and it must never be archivable out from under a
+    /// live pool — instance entries are pinned to the network maximum on every
+    /// mutating call, so a stream can never outlive the balance it was funded
+    /// against.
+    PooledBalance(Address),
     /// Persistent storage. One entry per stream.
     Stream(u64),
     /// Persistent storage. One entry per (stream_id, delegate) pair.

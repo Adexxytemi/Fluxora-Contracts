@@ -189,10 +189,14 @@ fn token_transfer(
 ///
 /// The outbound legs — [`FluxoraStream::withdraw`]'s payout and
 /// [`FluxoraStream::cancel`]'s refund — call [`token_transfer`] directly, with
-/// no balance check. If the token takes a further cut on receipt there, that
-/// is between the recipient (or sender) and their own balance: the *pool's*
+/// no balance-delta check. If the token takes a further cut on receipt there,
+/// that is between the recipient (or sender) and their own balance: the *pool's*
 /// balance still drops by exactly the amount the contract sent, so Fluxora's
 /// internal accounting stays in sync either way.
+///
+/// What *is* checked on the outbound legs is the pool total itself, by
+/// [`verify_pool_balance`] — see [`storage::PooledBalance`] and
+/// `docs/KNOWN-LIMITATIONS.md` §6.
 fn pull_deposit(env: &Env, token: &Address, from: &Address, amount: &i128) -> Result<(), Error> {
     let contract = env.current_contract_address();
     let token_client = token::TokenClient::new(env, token);
@@ -210,6 +214,58 @@ fn pull_deposit(env: &Env, token: &Address, from: &Address, amount: &i128) -> Re
     let received = after.checked_sub(before).ok_or(Error::Overflow)?;
     if received != *amount {
         return Err(Error::TokenAmountMismatch);
+    }
+
+    // The pull is verified, so the pool now holds exactly `amount` more for
+    // this token. Record it — this running total is what later operations
+    // reconcile against.
+    storage::credit_pool(env, token, *amount)?;
+    Ok(())
+}
+
+/// Reconcile the pool's real balance for `token` against the balance Fluxora
+/// has accounted for, rejecting a shortfall with [`Error::PoolBalanceDrift`].
+///
+/// # Why a running total rather than a sum over streams
+///
+/// The expected balance is maintained incrementally in
+/// [`DataKey::PooledBalance`]: every verified pull credits it, every payout
+/// and refund debits it. Deriving it instead — walking every stream at call
+/// time to sum `deposited - withdrawn` — is impossible here: the contract has
+/// no index of which streams hold which token, so the walk would need the
+/// whole stream population, which neither fits an invocation budget nor
+/// survives an archived entry. An incremental total is O(1) per call and, being
+/// instance storage, cannot archive while a stream does.
+///
+/// # Why a shortfall is checked and a surplus is not
+///
+/// `actual < expected` means the token destroyed value the pool was counting
+/// on: an elastic-supply rebase, or any balance move Fluxora was not a party
+/// to. Every outstanding claim is now backed by less than the accounting says,
+/// so paying any one of them out of the pool spends another stream's money —
+/// the invocation is rejected instead.
+///
+/// `actual > expected` is deliberately **accepted**. A positive rebase cannot
+/// cause an underpayment, and the excess is inert: payouts are sized by stream
+/// accounting, never by the pool balance, so the surplus simply sits there.
+/// Requiring equality would hand any third party a one-unit griefing stick —
+/// `transfer` a single stroop into the contract and every withdrawal in the
+/// protocol would revert with a drift error. A solvency check must not be
+/// triggerable by anyone who is not even a party to a stream.
+///
+/// # Where it is called
+///
+/// At the end of every operation that moves pool funds: after the payout in
+/// [`FluxoraStream::withdraw`] / [`delegate_withdraw`] / [`batch_withdraw`],
+/// after the refund in [`FluxoraStream::cancel`] / [`delegate_cancel`], and
+/// after the pull in [`FluxoraStream::top_up`] / [`delegate_top_up`]. So a
+/// rebase that happens between two operations is detected by the *next* one,
+/// which reverts in full.
+fn verify_pool_balance(env: &Env, token: &Address) -> Result<(), Error> {
+    let expected = storage::pooled_balance(env, token);
+    let actual = token::TokenClient::new(env, token).balance(&env.current_contract_address());
+    if actual < expected {
+        return Err(Error::PoolBalanceDrift);
     }
     Ok(())
 }
@@ -473,6 +529,10 @@ impl FluxoraStream {
         let sender = stream.sender.clone();
 
         pull_deposit(&env, &token, &sender, &amount)?;
+        // Reconcile the token's pool total now that the pull has landed. A
+        // rebase since the last operation on this token shows up as a
+        // shortfall and rolls the top-up back (Error::PoolBalanceDrift).
+        verify_pool_balance(&env, &token)?;
 
         storage::save_stream(&env, stream_id, &stream);
 
@@ -531,6 +591,11 @@ impl FluxoraStream {
         };
 
         Self::apply_withdrawal(&env, stream_id, &mut stream, payout)?;
+        // Reconcile the pool against the token's real balance now the payout
+        // has left it. A rebase between this token's last operation and this
+        // one shows up as a shortfall and rolls the withdrawal back
+        // (`Error::PoolBalanceDrift`) instead of letting the pool drift further.
+        verify_pool_balance(&env, &stream.token)?;
         Ok(payout)
     }
 
@@ -599,6 +664,20 @@ impl FluxoraStream {
                 storage::extend_stream(&env, stream_id, &stream);
             } else {
                 Self::apply_withdrawal(&env, stream_id, &mut stream, payout)?;
+            }
+        }
+
+        // Reconcile every token the batch touched, now that all payouts have
+        // left the pool. Deduplicated by token: a batch may hold several
+        // streams on one token (the payroll case), and one `balance`
+        // sub-invocation per stream would spend the instruction budget on
+        // repeated answers to the same question.
+        let mut reconciled: Vec<Address> = Vec::new(&env);
+        for stream in streams.iter() {
+            let token = stream.token.clone();
+            if !reconciled.contains(&token) {
+                verify_pool_balance(&env, &token)?;
+                reconciled.push_back(token);
             }
         }
 
@@ -685,6 +764,7 @@ impl FluxoraStream {
         storage::save_stream(&env, stream_id, &stream);
 
         if refund > 0 {
+            storage::debit_pool(&env, &token, refund)?;
             token_transfer(
                 &env,
                 &token,
@@ -693,6 +773,10 @@ impl FluxoraStream {
                 &refund,
             )?;
         }
+        // Reconcile the pool now the refund has left it. Checked even when the
+        // refund was zero: a rebase since the last operation on this token is
+        // exactly as dangerous with nothing to refund.
+        verify_pool_balance(&env, &token)?;
 
         // Issue #1584: the event's `vested` is read off the settled stream by
         // the helper (`stream.deposited`, set above), so it cannot disagree with
@@ -1012,6 +1096,11 @@ impl FluxoraStream {
         };
 
         Self::apply_withdrawal(&env, stream_id, &mut stream, payout)?;
+        // Reconcile the pool against the token's real balance now the payout
+        // has left it. A rebase between this token's last operation and this
+        // one shows up as a shortfall and rolls the withdrawal back
+        // (`Error::PoolBalanceDrift`) instead of letting the pool drift further.
+        verify_pool_balance(&env, &stream.token)?;
         Ok(payout)
     }
 
@@ -1042,6 +1131,7 @@ impl FluxoraStream {
         storage::save_stream(&env, stream_id, &stream);
 
         if refund > 0 {
+            storage::debit_pool(&env, &token, refund)?;
             token_transfer(
                 &env,
                 &token,
@@ -1050,6 +1140,8 @@ impl FluxoraStream {
                 &refund,
             )?;
         }
+        // Reconcile the pool now the refund has left it (see `cancel`).
+        verify_pool_balance(&env, &token)?;
 
         // `vested` is derived from the post-cancel `stream.deposited` inside
         // the event, so it is not passed separately.
@@ -1176,6 +1268,9 @@ impl FluxoraStream {
         // delegate triggered this call.
         sender.require_auth();
         pull_deposit(&env, &token, &sender, &amount)?;
+        // Same reconciliation as `top_up`: a rebase on this token is caught
+        // here and rolls the delegated top-up back.
+        verify_pool_balance(&env, &token)?;
 
         events::topped_up(&env, stream_id, &stream, amount);
         Ok(())
@@ -1464,6 +1559,9 @@ impl FluxoraStream {
 
         let token = stream.token.clone();
         let recipient = stream.recipient.clone();
+        // Accompany the outbound transfer with its accounting: the pool's
+        // expected balance drops by exactly what the recipient receives.
+        storage::debit_pool(env, &token, payout)?;
         storage::save_stream(env, stream_id, stream);
 
         token_transfer(

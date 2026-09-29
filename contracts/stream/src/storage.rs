@@ -307,6 +307,62 @@ pub fn stream_count(env: &Env) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// Pooled-token balance
+// ---------------------------------------------------------------------------
+
+/// The token balance Fluxora expects to be holding for `token`.
+///
+/// A missing entry reads as zero, which is the honest answer for a token no
+/// stream has ever been funded with. That default also keeps every test (and
+/// any state injected directly into storage) safe: an untracked token looks
+/// *surplus*, never short, so a defensive check cannot misfire on it.
+pub fn pooled_balance(env: &Env, token: &Address) -> i128 {
+    env.storage()
+        .instance()
+        .get(&DataKey::PooledBalance(token.clone()))
+        .unwrap_or(0)
+}
+
+/// Overwrite the expected pooled balance for `token`.
+///
+/// Private: the total is only ever moved by [`credit_pool`] / [`debit_pool`],
+/// which are checked. Writing it directly would let the reconciliation in
+/// [`crate::FluxoraStream`] be defeated from inside the module.
+fn set_pooled_balance(env: &Env, token: &Address, amount: i128) {
+    env.storage()
+        .instance()
+        .set(&DataKey::PooledBalance(token.clone()), &amount);
+    // The total is instance storage: keep it at maximum rent alongside the id
+    // counter, so it cannot archive while a stream that relies on it is live.
+    extend_instance(env);
+}
+
+/// Record that `amount` of `token` was pulled into the pool.
+///
+/// Called only after [`crate::pull_deposit`] has verified the token moved
+/// exactly `amount`.
+pub fn credit_pool(env: &Env, token: &Address, amount: i128) -> Result<(), Error> {
+    let next = pooled_balance(env, token)
+        .checked_add(amount)
+        .ok_or(Error::Overflow)?;
+    set_pooled_balance(env, token, next);
+    Ok(())
+}
+
+/// Record that `amount` of `token` is leaving the pool.
+///
+/// Debit happens before the outbound transfer: Soroban rolls the whole
+/// invocation back if the transfer fails, so the total can never be left
+/// debited for tokens that did not move.
+pub fn debit_pool(env: &Env, token: &Address, amount: i128) -> Result<(), Error> {
+    let next = pooled_balance(env, token)
+        .checked_sub(amount)
+        .ok_or(Error::Overflow)?;
+    set_pooled_balance(env, token, next);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Delegation
 // ---------------------------------------------------------------------------
 

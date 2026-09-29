@@ -229,12 +229,14 @@ Discriminants are ABI and are never renumbered; new variants are appended.
 | 31 | `InvalidTopUp` | Reserved; non-positive top-ups are rejected as `InvalidAmount` first. | reserved |
 | 32 | `TokenAmountMismatch` | Deposit pull changes pool balance by an unexpected amount. | reachable |
 | 33 | `VestedDecreased` | Reserved; current mutation paths preserve non-decreasing vested value. | reserved |
+| 34 | `PoolBalanceDrift` | A funds-moving operation found the pool's real token balance below the total Fluxora accounts for. | reachable |
 
 `TokenTransferFailed` (25) and `TokenMissing` (26) are **stable stream-level categories** for token sub-invocation failures. The token contract's internal error discriminant is intentionally discarded — forwarding it would produce a value clients decode against Fluxora's error table, yielding a silent misinterpretation. The raw diagnostic is visible in the failed transaction's `diagnosticEvents`.
 
 * `TokenTransferFailed` — the token contract returned a typed contract error: insufficient sender balance, pool underfunded on a payout, or the token's own authorization rules refused the call.
 * `TokenMissing` — the token address resolves to nothing (Abort / host trap); the stream references a non-deployed contract.
 * `TokenAmountMismatch` (32) — a deposit pull (`create_stream`, `top_up`, `delegate_top_up`) changed the pool's balance by something other than the requested amount. See "Token assumptions" below.
+* `PoolBalanceDrift` (34) — the pool's real token balance fell below the balance Fluxora accounts for. Raised by the reconciliation at the end of every operation that moves pool funds: `withdraw`, `delegate_withdraw`, `batch_withdraw`, `cancel`, `delegate_cancel`, `top_up` and `delegate_top_up`. A shortfall means the token changed balances outside a transfer Fluxora was party to — an elastic-supply rebase — and the whole invocation reverts rather than paying one recipient out of another's claim. A *surplus* is tolerated, never reported; see "Token assumptions" below.
 
 The CLI and RPC render these as `Error(Contract, #N)`.
 
@@ -289,21 +291,38 @@ grows that balance by precisely the amount passed in.
 > not the pool's — the pool still drops by exactly the amount the contract
 > sent, so Fluxora's internal accounting stays in sync either way.
 
-**2. The token does not rebase.** Fluxora never re-reads the pool's balance
-except immediately around a transfer it initiated itself. An elastic-supply
-token that changes the pool's balance out from under the contract — up or
-down, on some schedule the contract is not party to — desynchronizes the real
-balance from the sum of every stream's `deposited - withdrawn`.
+**2. The token does not rebase.** An elastic-supply token changes the pool's
+balance out from under the contract — up or down, on a schedule the contract
+is not party to — desynchronizing the real balance from the sum of every
+stream's `deposited - withdrawn`.
 
-> **Not detectable, not enforced.** There is no transfer to instrument; a
-> rebase does not happen inside a Fluxora invocation. If the pool balance
-> ever falls short of outstanding liabilities, the failure mode is a
-> legitimate `withdraw` or `cancel` refund returning
-> [`Error::TokenTransferFailed`](#error) once the shortfall is reached —
-> Fluxora fails closed rather than overpaying one recipient at another's
-> expense, but it does not compensate for the missing balance. Only fund a
-> stream with a token whose balance changes exclusively through transfers
-> Fluxora itself is a party to.
+> **Shortfalls are enforced, surpluses tolerated.** There is no transfer to
+> instrument, so a rebase cannot be caught as it happens. Instead Fluxora
+> keeps a running per-token total of the balance it expects to hold
+> (`DataKey::PooledBalance`) — every verified pull credits it, every payout
+> and refund debits it — and reconciles that total against the token's own
+> `balance` at the end of **every** operation that moves pool funds:
+> `withdraw`, `delegate_withdraw`, `batch_withdraw`, `cancel`,
+> `delegate_cancel`, `top_up` and `delegate_top_up`. A rebase between two
+> operations is therefore caught by the next one, which reverts in full with
+> [`Error::PoolBalanceDrift`](#error) (34).
+>
+> The test is `actual < expected`, not `actual != expected`. A **surplus** —
+> a positive rebase, a donation, dust — is accepted, because it cannot cause
+> an underpayment: every payout is sized by stream accounting and never by
+> the pool balance, so the excess simply sits there unclaimed. Demanding
+> equality would let anyone freeze the protocol by transferring a single unit
+> into the contract, and a solvency check anyone can trip is worse than the
+> risk it guards.
+>
+> Three gaps remain, and all are inherent. A rebase is only detected once an
+> operation touches that token — nothing runs while the contract is idle. A
+> positive rebase and a negative one on the same token that cancel out before
+> the next operation are invisible, because the total is only ever compared
+> against the token's own balance. And the expected total is built from
+> deposits the contract itself verified, so a pool that already held a balance
+> before this change reads as a surplus rather than being reconciled
+> retroactively. See `docs/KNOWN-LIMITATIONS.md` §6.
 
 **3. Zero-value transfers are never issued — so whether the token treats one
 as a no-op or a revert is immaterial.** Every entry point that could reach the
@@ -321,9 +340,12 @@ token with a non-positive amount is rejected first, before any token call:
 mock is rejected on both `create_stream` and `top_up`; a token that panics on
 any zero-value `transfer` call is proven never to be invoked with one, across
 `cancel`, `withdraw` and `batch_withdraw`; and an out-of-band balance loss on
-the pool (standing in for a negative rebase) is shown to fail closed with
-`Error::TokenTransferFailed` rather than corrupting an unrelated stream's
-accounting.
+the pool (standing in for a negative rebase) is rejected with
+`Error::PoolBalanceDrift` rather than corrupting an unrelated stream's
+accounting. `test::rebase_drift` builds the dedicated fixture: a token whose
+balance can be overwritten with no transfer at all, a rebase between deposit
+and withdrawal / top-up / cancel / batch withdrawal, per-token isolation, and
+the tolerated-surplus boundary.
 
 ---
 
@@ -642,6 +664,7 @@ it calls (`validate_batch_ids`, `reject_duplicate_ids`, `accrual::withdrawable`,
 | `TokenTransferFailed` | 25 | A payout's token transfer was rejected by the token contract (pool underfunded, or the token's own authorisation rules refused the call). The raw token discriminant is discarded — see the `Error` table above. |
 | `TokenMissing` | 26 | A payout's token address does not resolve to a deployed contract (host `Abort`). No funds moved. |
 | `MalformedStreamId` | 29 | A serialized element of `stream_ids` does not decode as a `u64`. |
+| `PoolBalanceDrift` | 34 | After every payout landed, one of the batch's tokens held less than the balance Fluxora accounts for — the token changed balances outside a transfer Fluxora was party to. Checked once per distinct token, and the batch reverts in full. |
 
 `StreamNotActive` (11) is reserved and is not returned here.
 | `StreamNotFound` | 1 | No readable entry for `stream_id`: the id was never issued, or its entry has been archived. Raised by `load_stream` before any other check. |
@@ -653,10 +676,11 @@ it calls (`validate_batch_ids`, `reject_duplicate_ids`, `accrual::withdrawable`,
 | `TopUpTooSmall` | 23 | `floor(amount * duration / deposited) == 0` — the top-up cannot buy even one second of schedule, so absorbing it would require raising the rate. |
 | `TokenTransferFailed` | 25 | The token contract returned a typed error on the deposit transfer (insufficient sender balance, trustline, or token auth rules). |
 | `TokenMissing` | 26 | The stream's token address has no deployed code (host Abort / trap). |
+| `PoolBalanceDrift` | 34 | After the pull landed, the token's pool balance was still short of the total Fluxora accounts for — a rebase since the last operation on this token. The top-up reverts in full. |
 
 This list was cross-checked against `FluxoraStream::top_up` in
 [`contracts/stream/src/lib.rs`](../contracts/stream/src/lib.rs) and the shared
-`token_transfer` helper; the nine variants above are the complete set it can
+`token_transfer` helper; the ten variants above are the complete set it can
 return. `Unauthorized` (7) is **not** reachable here — auth failures abort in
 the host before a typed error is produced.
 
@@ -680,6 +704,7 @@ Stops accrual and refunds the unvested remainder to the sender. The recipient ke
 * `Overflow` (22): Integer overflow occurred during the unvested remainder computation.
 * `TokenTransferFailed` (25): The token contract refused the refund transfer.
 * `TokenMissing` (26): The token contract does not exist.
+* `PoolBalanceDrift` (34): After the refund (if any) left the pool, the token held less than the balance Fluxora accounts for — a rebase since this token's last operation. Checked even when the refund is zero, and the cancel reverts in full.
 
 **Events:**
 * `cancelled` — Emitted on success.
@@ -705,12 +730,13 @@ or wrong signature surfaces as a host authentication failure, not a typed
 | `Overflow` | 22 | Checked arithmetic overflow while computing vested/withdrawable amounts, or while updating `withdrawn` / `paused_total` in the shared withdrawal tail. Unreachable for any stream created through the contract under normal schedules. |
 | `TokenTransferFailed` | 25 | The token contract returned a typed error on the payout transfer (insufficient pooled balance, deauthorized recipient trustline, or token auth rules). |
 | `TokenMissing` | 26 | The stream's token address has no deployed code (host Abort / trap). |
+| `PoolBalanceDrift` | 34 | After the payout left the pool, the token held less than the balance Fluxora accounts for — a rebase since this token's last operation. The withdrawal reverts in full, so a pool that is merely *short* can never pay a recipient out of another stream's claim. |
 
 This list was cross-checked against `FluxoraStream::withdraw` and
 `FluxoraStream::apply_withdrawal` in
 [`contracts/stream/src/lib.rs`](../contracts/stream/src/lib.rs), plus
 `accrual::withdrawable` / `accrual::vested` and the shared `token_transfer`
-helper; the eight variants above are the complete set the entry point can
+helper; the nine variants above are the complete set the entry point can
 return. `Unauthorized` (7) is **not** reachable here — auth failures abort in
 the host before a typed error is produced.
 
